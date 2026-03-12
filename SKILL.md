@@ -13,7 +13,7 @@ description: 微信 macOS 桌面客户端自动化操控。通过 AppleScript + 
 2. **辅助功能权限**已授予终端应用和 claude CLI（系统设置 → 隐私与安全性 → 辅助功能）
 3. **cliclick** 已安装（`brew install cliclick`）
 
-如果用户遇到权限错误，引导他们到系统设置添加相应权限。
+如果用户遇到权限错误（"不允许辅助访问"），引导他们到系统设置添加对应程序。需要授权的程序：终端应用（如 Warp、iTerm2）和 `/opt/homebrew/Caskroom/claude-code/*/claude`。
 
 ## 工具库
 
@@ -23,107 +23,117 @@ description: 微信 macOS 桌面客户端自动化操控。通过 AppleScript + 
 source ~/.agents/skills/wechat-automation/scripts/wechat-utils.sh
 ```
 
+## 踩坑指南（必读）
+
+以下是实际操控中验证过的经验，违反这些规则会导致操作失败：
+
+### 绝对不要做
+
+| 操作 | 后果 | 正确做法 |
+|------|------|---------|
+| 用 `Cmd+F` 搜索会话 | 打开全局搜索（含网络/公众号搜索），不是会话搜索 | 用 `wechat_open_chat` 点击侧边栏搜索框 |
+| 用 `Cmd+N` 找已有会话 | 创建新群聊 | 用 `wechat_open_chat` |
+| 用 `keystroke` 输入中文/emoji | 输入为空或乱码 | 用 `wechat_paste` 通过剪贴板粘贴 |
+| 不移动鼠标直接滚动 | 滚到别的窗口 | 先 `wechat_move` 到聊天区域再 `wechat_scroll` |
+| 用 Page Up/Down 翻页 | 焦点跳到别的应用 | 用 `wechat_scroll_chat` |
+| 搜索后不清理输入框 | 残留文字被当消息发出 | `wechat_open_chat` 已内置清理；`wechat_send_message` 也会先清空 |
+
+### 必须做
+
+- **截屏验证**：UI 自动化天生不稳定。关键操作后调用 `wechat_screenshot` + Read 工具确认状态
+- **激活后缓存窗口信息**：`wechat_activate` 会自动缓存窗口坐标，后续操作复用，避免重复查询
+- **滚动前定位鼠标**：`wechat_scroll_chat` 已内置移动鼠标逻辑，直接用它而不是裸调 `wechat_scroll`
+
 ## 可用操作
 
 ### 基础操作
 
 | 函数 | 参数 | 说明 |
 |------|------|------|
-| `wechat_activate` | 无 | 激活微信窗口并置顶 |
-| `wechat_screenshot [path]` | 输出路径（默认 /tmp/wechat-screenshot.png） | 截取当前屏幕 |
-| `wechat_window_info` | 无 | 返回 `x,y,width,height` |
-| `wechat_click x y` | 坐标 | 点击指定位置 |
-| `wechat_move_mouse x y` | 坐标 | 移动鼠标 |
-| `wechat_paste_text "文本"` | 文本内容 | 通过剪贴板粘贴（支持中文/emoji） |
-| `wechat_key keycode` | macOS key code | 模拟按键 |
-| `wechat_shortcut "key"` | 按键字符 | 模拟 Cmd+key |
-| `wechat_scroll direction count` | up/down, 次数 | 在鼠标位置滚动 |
+| `wechat_activate` | — | 激活微信窗口、置顶、缓存窗口坐标 |
+| `wechat_screenshot [path]` | 输出路径 | 截取当前屏幕 |
+| `wechat_paste "文本"` | 文本内容 | 通过剪贴板粘贴（唯一正确的输入方式） |
+| `wechat_key keycode` | [key code](references/key-codes.md) | 模拟按键（36=回车, 53=ESC, 51=删除） |
+| `wechat_cmd "key"` | 字符 | 模拟 Cmd+key |
+| `wechat_click x y` | 坐标 | 点击 |
+| `wechat_move x y` | 坐标 | 移动鼠标（滚动前必须调用） |
+| `wechat_scroll dir count` | up/down, 次数 | 在鼠标当前位置滚动 |
 
 ### 组合操作
 
 | 函数 | 参数 | 说明 |
 |------|------|------|
-| `wechat_focus_chat` | 无 | 点击聊天区域中心 |
-| `wechat_focus_input` | 无 | 点击消息输入框 |
-| `wechat_scroll_chat direction count` | up/down, 次数 | 在聊天区域滚动 |
-| `wechat_open_chat "名称"` | 联系人/群名 | 搜索并进入指定会话 |
-| `wechat_send_message "消息"` | 消息文本 | 在当前会话发送消息 |
+| `wechat_open_chat "名称"` | 联系人/群名 | 点击侧边栏搜索 → 粘贴 → 回车 → ESC 关闭搜索面板 |
+| `wechat_scroll_chat dir count` | up/down, 次数 | 移动鼠标到聊天区域 → 滚动 |
+| `wechat_send_message "消息"` | 消息文本 | 点击输入框 → 清空 → 粘贴 → 回车，自动追加签名 |
 
 ### 高级操作（支持后台模式）
 
 | 函数 | 参数 | 说明 |
 |------|------|------|
-| `wechat_send_to "名称" "消息" [background]` | 联系人、消息、是否后台(默认true) | 完整发送流程 |
-| `wechat_read_chat [scroll_up] [output] [background]` | 向上滚动次数、输出路径、是否后台 | 截屏当前会话 |
-| `wechat_view_chat "名称" [scroll_up] [output] [background]` | 联系人、滚动次数、输出路径、是否后台 | 打开会话并截屏 |
+| `wechat_send_to "名称" "消息" [bg]` | 联系人、消息、后台(默认true) | 完整流程：激活 → 搜索 → 发送 → 切回 |
+| `wechat_read_chat [scroll] [path] [bg]` | 滚动次数、路径、后台 | 截屏当前会话 |
+| `wechat_view_chat "名称" [scroll] [path] [bg]` | 联系人、滚动、路径、后台 | 搜索会话 → 截屏 |
+
+后台模式（默认开启）：操作前保存当前前台应用和剪贴板，操作后恢复。微信只需短暂前台 3-5 秒。
 
 ## 使用模式
 
-### 发送消息
+### 发消息
 
 ```bash
 source ~/.agents/skills/wechat-automation/scripts/wechat-utils.sh
 wechat_send_to "张三" "你好" true
 ```
 
-后台模式（第三个参数 `true`）会在操作完成后自动切回用户之前的前台应用，减少干扰。
-
 ### 查看聊天记录
 
-使用截屏 + Read 工具查看聊天内容：
+截屏 + Read 工具读取分析：
 
 ```bash
 source ~/.agents/skills/wechat-automation/scripts/wechat-utils.sh
 wechat_view_chat "群名" 80 /tmp/chat.png true
+# 然后 Read /tmp/chat.png 查看内容
 ```
 
-然后用 Read 工具读取截图分析聊天内容。`scroll_up` 参数控制向上滚动的幅度（每单位约半行）。
+### 连续浏览历史
 
-### 连续浏览历史记录
-
-先进入会话，然后多次滚动截屏：
+如果已在目标会话中，不要再调 `wechat_open_chat`（会重新搜索），直接滚动：
 
 ```bash
 source ~/.agents/skills/wechat-automation/scripts/wechat-utils.sh
 wechat_activate
-wechat_open_chat "群名"
-for i in 1 2 3; do
-    wechat_scroll_chat up 80
+# 假设已在目标会话中
+for i in 1 2 3 4 5; do
+    wechat_scroll_chat up 100
     wechat_screenshot "/tmp/chat-${i}.png"
 done
+# 批量 Read 截图分析
 ```
 
-### 自由组合操作
+### 截屏驱动的操控模式
 
-基础操作可以自由组合来应对复杂场景。每一步之后建议截屏确认状态。例如：
+对于不确定的场景，采用「截屏 → 分析 → 操作 → 截屏验证」循环：
 
 ```bash
 source ~/.agents/skills/wechat-automation/scripts/wechat-utils.sh
 wechat_activate
-wechat_screenshot /tmp/step1.png   # 看当前状态
-# 通过 Read 工具查看截图，决定下一步操作
+wechat_screenshot /tmp/step1.png   # 看当前状态，Read 分析
+# 根据截图决定下一步...
 wechat_open_chat "某人"
-wechat_screenshot /tmp/step2.png   # 确认进入了正确的会话
+wechat_screenshot /tmp/step2.png   # 确认进入正确会话
 wechat_send_message "你好"
-wechat_screenshot /tmp/step3.png   # 确认消息已发送
+wechat_screenshot /tmp/step3.png   # 确认发送成功
 ```
-
-## 关键注意事项
-
-- **中文/emoji 必须通过剪贴板**：`keystroke` 只支持 ASCII，所有中文和 emoji 内容使用 `wechat_paste_text` 粘贴
-- **不要用 Cmd+F 搜索会话**：Cmd+F 打开的是全局搜索（包含网络搜索），用 `wechat_open_chat` 点击左侧搜索栏
-- **不要用 Cmd+N**：Cmd+N 是新建群聊，不是搜索已有会话
-- **搜索后清理输入框**：`wechat_open_chat` 已内置 Cmd+A + Delete 清理逻辑
-- **截屏验证**：UI 自动化天然不稳定，重要操作后截屏确认
-- **后台模式**：高级操作默认开启后台模式，操作完切回用户之前的应用
-- **延迟调整**：如果网络慢或电脑卡，搜索结果可能加载不及时，可以手动在操作间增加 sleep
 
 ## 故障排查
 
-如果操作失败，按以下顺序检查：
-1. 微信是否已登录且窗口存在
-2. 辅助功能权限是否已授予终端和 claude CLI
-3. cliclick 是否已安装
-4. 截屏当前状态分析 UI 是否符合预期
+| 症状 | 原因 | 解决 |
+|------|------|------|
+| "不允许辅助访问" | 缺少辅助功能权限 | 系统设置 → 辅助功能，添加终端和 claude CLI |
+| 搜索打开了网络结果 | 误用了 Cmd+F | 用 `wechat_open_chat`（点击侧边栏搜索框） |
+| 滚动滚到了别的窗口 | 鼠标不在微信上 | 用 `wechat_scroll_chat` 而非裸调 `wechat_scroll` |
+| 发出了群名当消息 | 搜索残留未清理 | `wechat_send_message` 已内置清空逻辑 |
+| 点到了公众号/其他页面 | 窗口坐标偏移 | 先 `wechat_activate` 刷新坐标缓存 |
 
 详细的按键码和 UI 布局信息见 `references/key-codes.md`。
