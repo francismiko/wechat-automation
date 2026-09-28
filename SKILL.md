@@ -1,139 +1,99 @@
 ---
 name: wechat-automation
-description: 微信 macOS 桌面客户端自动化操控。通过 AppleScript + cliclick 实现发消息、读聊天记录、搜索会话、滚动浏览等操作。当用户提到微信、WeChat、发消息给某人、给群里发消息、看看群里在聊啥、微信自动化、定时发微信等需求时触发此 skill。支持后台模式——操作完自动切回之前的应用，不打断用户工作。
+description: Automate the WeChat desktop client on macOS (WeChat 4.x). Reads messages, sends messages, lists and searches chats through WeChat-MCP's wechat-cli (macOS Accessibility API), with screenshots and scrolling for visual checks. Trigger when the user mentions WeChat / 微信, sending a message to someone, posting in a group, checking what a group is talking about, WeChat automation, or scheduled WeChat messages. Restores the previously active app when done.
 ---
 
 # WeChat macOS Automation
 
-通过 macOS 辅助功能 API 控制微信桌面客户端，实现消息收发和聊天记录浏览。
+Controls the WeChat 4.x desktop client through WeChat-MCP's command line tool `wechat-cli`. Every chat and message operation goes through the Accessibility API and is verified step by step: confirm the right chat is open, write the text into the input field and read it back, send, then check the newest bubble. It **never** clicks blind coordinates or simulates keyboard typing.
 
-## 前提条件
+## Prerequisites
 
-1. **微信 macOS 版**已安装并登录
-2. **辅助功能权限**已授予终端应用和 claude CLI（系统设置 → 隐私与安全性 → 辅助功能）
-3. **cliclick** 已安装（`brew install cliclick`）
+1. **WeChat for Mac 4.x** installed and signed in (verified on 4.1.13; 3.x has a different UI and is not supported)
+2. **WeChat-MCP** installed: either the sibling directory `../WeChat-MCP` of this skill (after `uv sync`), or `pip install wechat-mcp-server` so that `wechat-cli` is on PATH, or `export WECHAT_MCP_DIR=/path/to/WeChat-MCP`
+3. **Accessibility** and **Screen Recording** permissions granted to the terminal app and the claude CLI (System Settings → Privacy & Security)
+4. **cliclick** installed (`brew install cliclick`, only needed for scrolling before screenshots)
 
-如果用户遇到权限错误（"不允许辅助访问"），引导他们到系统设置添加对应程序。需要授权的程序：终端应用（如 Warp、iTerm2）和 `/opt/homebrew/Caskroom/claude-code/*/claude`。
+If the user hits a permission error ("not allowed assistive access"), point them to System Settings and the apps that need to be added: the terminal (Terminal, Warp, iTerm2, ...) and `/opt/homebrew/Caskroom/claude-code/*/claude`.
 
-## 工具库
-
-所有操作封装在 `scripts/wechat-utils.sh` 中。使用前先 source：
+## Library
 
 ```bash
 source ~/.agents/skills/wechat-automation/scripts/wechat-utils.sh
 ```
 
-## 踩坑指南（必读）
+## Operations
 
-以下是实际操控中验证过的经验，违反这些规则会导致操作失败：
+### Chats and messages (via wechat-cli; a non-zero return means failure)
 
-### 绝对不要做
+| Function | Arguments | Description |
+|----------|-----------|-------------|
+| `wechat_check` | — | WeChat version / UI compatibility report. **Run this first after a WeChat update** |
+| `wechat_list_chats [max] [--json]` | count | Sidebar chats: time, name, last message, muted |
+| `wechat_fetch "name" [n] [--json]` | chat, count | Last n messages as `[sender] text`; group messages carry the member name, `---` lines are timestamps / notices |
+| `wechat_open_chat "name"` | chat | Open a chat (session list first, then exact search match); fails if a different chat ends up open |
+| `wechat_send_message "name" "text"` | chat, text | Confirm the chat, send, verify |
+| `wechat_send_to "name" "text"` | chat, text | Same, with a human readable success / failure line |
+| `wechat_current_chat` | — | Name of the chat that is open |
 
-| 操作 | 后果 | 正确做法 |
-|------|------|---------|
-| 用 `Cmd+F` 搜索会话 | 打开全局搜索（含网络/公众号搜索），不是会话搜索 | 用 `wechat_open_chat` 点击侧边栏搜索框 |
-| 用 `Cmd+N` 找已有会话 | 创建新群聊 | 用 `wechat_open_chat` |
-| 用 `keystroke` 输入中文/emoji | 输入为空或乱码 | 用 `wechat_paste` 通过剪贴板粘贴 |
-| 不移动鼠标直接滚动 | 滚到别的窗口 | 先 `wechat_move` 到聊天区域再 `wechat_scroll` |
-| 用 Page Up/Down 翻页 | 焦点跳到别的应用 | 用 `wechat_scroll_chat` |
-| 搜索后不清理输入框 | 残留文字被当消息发出 | `wechat_open_chat` 已内置清理；`wechat_send_message` 也会先清空 |
+`wechat-cli` can also be called directly: `wechat_cli --text fetch "Group" -n 50`, `wechat_cli moment "text" --draft`, `wechat_cli add-contact wxid_xxx --message "hi"`. Drop `--text` to get JSON.
 
-### 必须做
+### Screenshots and scrolling (only for visual checks: photos, stickers, file previews)
 
-- **截屏验证**：UI 自动化天生不稳定。关键操作后调用 `wechat_screenshot` + Read 工具确认状态
-- **激活后缓存窗口信息**：`wechat_activate` 会自动缓存窗口坐标，后续操作复用，避免重复查询
-- **滚动前定位鼠标**：`wechat_scroll_chat` 已内置移动鼠标逻辑，直接用它而不是裸调 `wechat_scroll`
+| Function | Arguments | Description |
+|----------|-----------|-------------|
+| `wechat_activate` | — | Bring WeChat to the front and cache the window frame |
+| `wechat_screenshot [path] [full]` | output path | Capture the WeChat main window (`full` for the whole screen) |
+| `wechat_scroll_chat dir count` | up/down, count | Move the pointer over the message area, then scroll (move only, no click) |
+| `wechat_view_chat "name" [scroll] [path] [bg]` | chat, scroll, path, background | Open the chat → scroll → screenshot |
+| `wechat_read_chat [scroll] [path] [bg]` | scroll, path, background | Screenshot the current chat |
+| `wechat_key keycode` / `wechat_move x y` / `wechat_scroll dir count` | low-level key / pointer / scroll | Rarely needed directly |
 
-## 可用操作
+## Patterns
 
-### 基础操作
-
-| 函数 | 参数 | 说明 |
-|------|------|------|
-| `wechat_activate` | — | 激活微信窗口、置顶、缓存窗口坐标 |
-| `wechat_screenshot [path]` | 输出路径 | 截取当前屏幕 |
-| `wechat_paste "文本"` | 文本内容 | 通过剪贴板粘贴（唯一正确的输入方式） |
-| `wechat_key keycode` | [key code](references/key-codes.md) | 模拟按键（36=回车, 53=ESC, 51=删除） |
-| `wechat_cmd "key"` | 字符 | 模拟 Cmd+key |
-| `wechat_click x y` | 坐标 | 点击 |
-| `wechat_move x y` | 坐标 | 移动鼠标（滚动前必须调用） |
-| `wechat_scroll dir count` | up/down, 次数 | 在鼠标当前位置滚动 |
-
-### 组合操作
-
-| 函数 | 参数 | 说明 |
-|------|------|------|
-| `wechat_open_chat "名称"` | 联系人/群名 | 点击侧边栏搜索 → 粘贴 → 回车 → ESC 关闭搜索面板 |
-| `wechat_scroll_chat dir count` | up/down, 次数 | 移动鼠标到聊天区域 → 滚动 |
-| `wechat_send_message "消息"` | 消息文本 | 点击输入框 → 清空 → 粘贴 → 回车，自动追加签名 |
-
-### 高级操作（支持后台模式）
-
-| 函数 | 参数 | 说明 |
-|------|------|------|
-| `wechat_send_to "名称" "消息" [bg]` | 联系人、消息、后台(默认true) | 完整流程：激活 → 搜索 → 发送 → 切回 |
-| `wechat_read_chat [scroll] [path] [bg]` | 滚动次数、路径、后台 | 截屏当前会话 |
-| `wechat_view_chat "名称" [scroll] [path] [bg]` | 联系人、滚动、路径、后台 | 搜索会话 → 截屏 |
-
-后台模式（默认开启）：操作前保存当前前台应用和剪贴板，操作后恢复。微信只需短暂前台 3-5 秒。
-
-## 使用模式
-
-### 发消息
+### Send a message
 
 ```bash
 source ~/.agents/skills/wechat-automation/scripts/wechat-utils.sh
-wechat_send_to "张三" "你好" true
+wechat_send_to "Alice" "Meeting tomorrow at 3pm"
 ```
 
-### 查看聊天记录
-
-截屏 + Read 工具读取分析：
+### What is a group talking about (prefer text over screenshots)
 
 ```bash
 source ~/.agents/skills/wechat-automation/scripts/wechat-utils.sh
-wechat_view_chat "群名" 80 /tmp/chat.png true
-# 然后 Read /tmp/chat.png 查看内容
+wechat_fetch "Project Group" 50
 ```
 
-### 连续浏览历史
-
-如果已在目标会话中，不要再调 `wechat_open_chat`（会重新搜索），直接滚动：
+### Which chats have new messages
 
 ```bash
-source ~/.agents/skills/wechat-automation/scripts/wechat-utils.sh
-wechat_activate
-# 假设已在目标会话中
-for i in 1 2 3 4 5; do
-    wechat_scroll_chat up 100
-    wechat_screenshot "/tmp/chat-${i}.png"
-done
-# 批量 Read 截图分析
+wechat_list_chats 20
 ```
 
-### 截屏驱动的操控模式
-
-对于不确定的场景，采用「截屏 → 分析 → 操作 → 截屏验证」循环：
+### Screenshot only when you need to see images or stickers
 
 ```bash
-source ~/.agents/skills/wechat-automation/scripts/wechat-utils.sh
-wechat_activate
-wechat_screenshot /tmp/step1.png   # 看当前状态，Read 分析
-# 根据截图决定下一步...
-wechat_open_chat "某人"
-wechat_screenshot /tmp/step2.png   # 确认进入正确会话
-wechat_send_message "你好"
-wechat_screenshot /tmp/step3.png   # 确认发送成功
+wechat_view_chat "Project Group" 0 /tmp/chat.png
+# then Read /tmp/chat.png
 ```
 
-## 故障排查
+## Rules
 
-| 症状 | 原因 | 解决 |
-|------|------|------|
-| "不允许辅助访问" | 缺少辅助功能权限 | 系统设置 → 辅助功能，添加终端和 claude CLI |
-| 搜索打开了网络结果 | 误用了 Cmd+F | 用 `wechat_open_chat`（点击侧边栏搜索框） |
-| 滚动滚到了别的窗口 | 鼠标不在微信上 | 用 `wechat_scroll_chat` 而非裸调 `wechat_scroll` |
-| 发出了群名当消息 | 搜索残留未清理 | `wechat_send_message` 已内置清空逻辑 |
-| 点到了公众号/其他页面 | 窗口坐标偏移 | 先 `wechat_activate` 刷新坐标缓存 |
+- **Only send through the functions above.** Never type into WeChat yourself with `keystroke` or `cliclick`: if the focus is not in the expected input field the text goes to the wrong contact (this has happened).
+- Chat names must match **exactly** (case-insensitive, group names without the member-count suffix). When the name is not exact, `wechat_open_chat` fails and lists candidates; confirm the right one with the user before sending.
+- When a function returns non-zero, stop and tell the user. Do not try other "clever" ways to send.
+- "File Transfer" (文件传输助手) cannot be found through search, but it is in the session list (the tool scrolls to find it).
+- If tools fail after a WeChat update, run `wechat_check` first: it shows whether the version is verified and which UI elements are missing.
 
-详细的按键码和 UI 布局信息见 `references/key-codes.md`。
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `wechat-cli not found` | WeChat-MCP not installed / wrong path | `uv sync` in the WeChat-MCP directory, or `export WECHAT_MCP_DIR=...` |
+| "not allowed assistive access" / no messages read | Missing Accessibility or Screen Recording permission | System Settings → Privacy & Security, add the terminal and the claude CLI |
+| A different chat opened | Inexact chat name | Confirm the exact name via `wechat_list_chats` or the candidate list |
+| `warnings` about an unverified version | WeChat was updated | `wechat_check`; once verified, add the version to `compat.py` in WeChat-MCP |
+| Sender UNKNOWN / empty group member names | No Screen Recording permission or the window is covered | Grant Screen Recording; bring the WeChat window to the front if needed |
+
+Key codes and the UI layout are in `references/key-codes.md`. 中文版见 `SKILL_zh.md`。
