@@ -1,41 +1,61 @@
 #!/bin/bash
-# 微信 macOS 自动化操作库 v2
-# 基于实际操控经验整理的最佳实践版本
+# WeChat macOS automation library v4
+# For WeChat 4.x (verified on WeChat 4.1.13)
 #
-# 核心原则：
-#   1. 所有文本输入必须走剪贴板（keystroke 不支持中文/emoji）
-#   2. 多步 AppleScript 合并为单次 osascript 调用，减少开销
-#   3. 坐标操作前先获取窗口信息，动态计算
-#   4. 关键操作后截屏验证状态
-#   5. 滚动前必须确保鼠标在目标区域上
+# Architecture:
+#   - Finding chats, reading, sending and listing chats are delegated to
+#     WeChat-MCP's command line tool `wechat-cli` (Python + Accessibility API).
+#     It confirms the right chat is open, writes the text into the input field
+#     through Accessibility and reads it back, sends, then checks the newest
+#     bubble. It never types blindly.
+#   - This file keeps only what the shell is good at: activating / restoring
+#     apps, screenshots, scrolling, key presses.
 #
-# 已知限制：
-#   - Cmd+F 是全局搜索（含网络搜索），不能用来找会话
-#   - Cmd+N 是新建群聊，不是搜索已有会话
-#   - 微信 AXUIElement 暴露极少，无法用辅助功能 API 定位搜索框
-#   - 侧边栏搜索框没有键盘快捷键，只能靠坐标点击
-#   - 会话列表排序随新消息变化，不能靠固定位置选会话
+# Prerequisites:
+#   - WeChat-MCP set up with `uv sync` (default: the sibling directory
+#     ../WeChat-MCP of this skill, or WECHAT_MCP_DIR; a `wechat-cli` on PATH
+#     is used directly)
+#   - Accessibility and Screen Recording permissions for the terminal / claude
+#   - cliclick installed (only needed to move the pointer before scrolling)
 
 # ============================================================
-# 配置
+# Configuration
 # ============================================================
-WECHAT_SIGNATURE=" ʕ•ᴥ•ʔ"
+WECHAT_BUNDLE_ID="com.tencent.xinWeChat"
+WECHAT_PROCESS="WeChat"
+# Signature appended to every message; empty by default. export WECHAT_SIGNATURE=" ʕ•ᴥ•ʔ" to enable
+WECHAT_SIGNATURE="${WECHAT_SIGNATURE:-}"
+
+_wechat_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-${(%):-%x}}")" 2>/dev/null && pwd)"
+WECHAT_MCP_DIR="${WECHAT_MCP_DIR:-$(cd "${_wechat_script_dir}/../../WeChat-MCP" 2>/dev/null && pwd)}"
 
 # ============================================================
-# 内部状态
+# Internal state
 # ============================================================
 _wechat_saved_app=""
-_wechat_saved_clipboard=""
 _wechat_win_x=""
 _wechat_win_y=""
 _wechat_win_w=""
 _wechat_win_h=""
 
 # ============================================================
-# 内部辅助
+# CLI invocation
+# ============================================================
+wechat_cli() {
+    if command -v wechat-cli >/dev/null 2>&1; then
+        wechat-cli "$@"
+    elif [ -n "$WECHAT_MCP_DIR" ] && [ -f "$WECHAT_MCP_DIR/pyproject.toml" ]; then
+        uv run --quiet --directory "$WECHAT_MCP_DIR" wechat-cli "$@"
+    else
+        echo "✗ wechat-cli not found: install WeChat-MCP (pip install wechat-mcp-server) or set WECHAT_MCP_DIR" >&2
+        return 127
+    fi
+}
+
+# ============================================================
+# Internal helpers
 # ============================================================
 _wechat_save_context() {
-    _wechat_saved_clipboard=$(pbpaste 2>/dev/null || true)
     _wechat_saved_app=$(osascript -e '
     tell application "System Events"
         set frontApp to name of first application process whose frontmost is true
@@ -44,104 +64,73 @@ _wechat_save_context() {
 }
 
 _wechat_restore_context() {
-    if [ -n "$_wechat_saved_clipboard" ]; then
-        printf '%s' "$_wechat_saved_clipboard" | pbcopy 2>/dev/null || true
-    fi
-    if [ -n "$_wechat_saved_app" ] && [ "$_wechat_saved_app" != "WeChat" ]; then
+    if [ -n "$_wechat_saved_app" ] && [ "$_wechat_saved_app" != "$WECHAT_PROCESS" ]; then
         osascript -e "tell application \"$_wechat_saved_app\" to activate" 2>/dev/null
     fi
     _wechat_saved_app=""
-    _wechat_saved_clipboard=""
 }
 
+# Main window frame: first standard window (independent of the UI language)
 _wechat_update_window() {
     local info
-    info=$(osascript -e '
-    tell application "System Events"
-        tell process "WeChat"
-            tell window "微信"
-                set winPos to position
-                set winSize to size
-            end tell
-            return (item 1 of winPos as text) & "," & (item 2 of winPos as text) & "," & (item 1 of winSize as text) & "," & (item 2 of winSize as text)
+    info=$(osascript -e "
+    tell application \"System Events\"
+        tell process \"$WECHAT_PROCESS\"
+            set w to missing value
+            try
+                set w to first window whose subrole is \"AXStandardWindow\"
+            end try
+            if w is missing value then set w to window 1
+            set winPos to position of w
+            set winSize to size of w
+            return (item 1 of winPos as text) & \",\" & (item 2 of winPos as text) & \",\" & (item 1 of winSize as text) & \",\" & (item 2 of winSize as text)
         end tell
-    end tell' 2>/dev/null)
+    end tell" 2>/dev/null)
     IFS=',' read -r _wechat_win_x _wechat_win_y _wechat_win_w _wechat_win_h <<< "$info"
 }
 
+# Centre of the message area (WeChat 4.x default layout: 60px tab bar + 240px session list)
+_wechat_chat_center() {
+    [ -z "$_wechat_win_x" ] && _wechat_update_window
+    echo "$(( _wechat_win_x + 300 + (_wechat_win_w - 300) / 2 )) $(( _wechat_win_y + _wechat_win_h / 2 ))"
+}
+
 # ============================================================
-# 基础操作：激活微信
+# Basics: activate WeChat / screenshot / keys / pointer / scroll
 # ============================================================
 wechat_activate() {
-    osascript -e '
-    tell application "WeChat" to activate
+    osascript -e "
+    tell application id \"$WECHAT_BUNDLE_ID\" to activate
     delay 0.5
-    tell application "System Events"
-        tell process "WeChat"
+    tell application \"System Events\"
+        tell process \"$WECHAT_PROCESS\"
             set frontmost to true
         end tell
     end tell
-    delay 0.3'
+    delay 0.3" >/dev/null 2>&1
     _wechat_update_window
 }
 
-# ============================================================
-# 基础操作：截屏
-# ============================================================
+# Captures the WeChat main window by default; pass `full` as 2nd argument for the whole screen
 wechat_screenshot() {
-    local output="${1:-/tmp/wechat-screenshot.png}"
-    screencapture -x "$output"
+    local output="${1:-/tmp/wechat-screenshot.png}" mode="${2:-window}"
+    [ -z "$_wechat_win_x" ] && _wechat_update_window
+    if [ "$mode" = "window" ] && [ -n "$_wechat_win_x" ]; then
+        screencapture -x -R "${_wechat_win_x},${_wechat_win_y},${_wechat_win_w},${_wechat_win_h}" "$output"
+    else
+        screencapture -x "$output"
+    fi
     echo "$output"
 }
 
-# ============================================================
-# 基础操作：通过剪贴板粘贴文本
-# 这是唯一正确的文本输入方式，keystroke 不支持中文/emoji
-# ============================================================
-wechat_paste() {
-    local text="$1"
-    printf '%s' "$text" | pbcopy
-    sleep 0.1
-    osascript -e '
-    tell application "System Events"
-        tell process "WeChat"
-            keystroke "v" using command down
-        end tell
-    end tell'
-    sleep 0.3
-}
-
-# ============================================================
-# 基础操作：按键 / 快捷键
-# ============================================================
 wechat_key() {
-    local keycode=$1
     osascript -e "
     tell application \"System Events\"
-        tell process \"WeChat\"
-            key code ${keycode}
+        tell process \"$WECHAT_PROCESS\"
+            key code ${1}
         end tell
-    end tell"
+    end tell" >/dev/null 2>&1
     sleep 0.2
-}
-
-wechat_cmd() {
-    local key="$1"
-    osascript -e "
-    tell application \"System Events\"
-        tell process \"WeChat\"
-            keystroke \"${key}\" using command down
-        end tell
-    end tell"
-    sleep 0.3
-}
-
-# ============================================================
-# 基础操作：点击 / 移动鼠标
-# ============================================================
-wechat_click() {
-    cliclick "c:${1},${2}"
-    sleep 0.3
 }
 
 wechat_move() {
@@ -149,10 +138,7 @@ wechat_move() {
     sleep 0.1
 }
 
-# ============================================================
-# 基础操作：滚动
-# 必须先确保鼠标在目标区域上，否则会滚错窗口
-# ============================================================
+# Scroll at the current pointer position; move the pointer over the target first
 wechat_scroll() {
     local direction="${1:-up}" count="${2:-10}"
     local delta=5
@@ -160,172 +146,107 @@ wechat_scroll() {
     osascript -l JavaScript -e "
     ObjC.import('CoreGraphics');
     for (var i = 0; i < ${count}; i++) {
-        var event = $.CGEventCreateScrollWheelEvent(null, 0, 1, ${delta});
-        $.CGEventPost(0, event);
+        var event = \$.CGEventCreateScrollWheelEvent(null, 0, 1, ${delta});
+        \$.CGEventPost(0, event);
         delay(0.05);
     }"
     sleep 0.3
 }
 
-# ============================================================
-# 组合操作：搜索并进入会话
-#
-# 最佳实践（踩坑总结）：
-#   ✅ 点击侧边栏搜索框 → 粘贴关键词 → 回车
-#   ❌ Cmd+F → 全局搜索含网络结果
-#   ❌ Cmd+N → 新建群聊
-#
-# 搜索框坐标通过截屏确认后动态微调。
-# 搜索结果选中后，用 ESC 关闭搜索面板避免残留。
-# ============================================================
-wechat_open_chat() {
-    local contact="$1"
-    [ -z "$_wechat_win_x" ] && _wechat_update_window
-
-    osascript <<APPLESCRIPT
-    tell application "System Events"
-        tell process "WeChat"
-            set frontmost to true
-            delay 0.2
-
-            -- 点击侧边栏搜索框
-            -- 搜索框在窗口顶部左侧区域，宽度约为侧边栏宽度
-            click at {${_wechat_win_x} + 120, ${_wechat_win_y} + 35}
-            delay 0.8
-
-            -- 清空搜索框可能的残留内容
-            keystroke "a" using command down
-            delay 0.1
-            key code 51
-            delay 0.2
-        end tell
-    end tell
-APPLESCRIPT
-
-    # 粘贴搜索关键词（必须用剪贴板）
-    wechat_paste "$contact"
-    sleep 1.5
-
-    # 回车选中第一个结果进入会话
-    wechat_key 36
-    sleep 1.0
-
-    # ESC 确保关闭搜索面板
-    wechat_key 53
-    sleep 0.3
-}
-
-# ============================================================
-# 组合操作：在聊天区域滚动
-# 先移动鼠标到聊天区域中心，再滚动，避免滚错窗口
-# ============================================================
+# Scroll the message area: move the pointer first (no click, a click could open a photo / file)
 wechat_scroll_chat() {
     local direction="${1:-up}" count="${2:-10}"
-    [ -z "$_wechat_win_x" ] && _wechat_update_window
-    local cx=$(( _wechat_win_x + 200 + (_wechat_win_w - 200) / 2 ))
-    local cy=$(( _wechat_win_y + _wechat_win_h / 2 ))
+    local cx cy
+    read -r cx cy <<< "$(_wechat_chat_center)"
     wechat_move "$cx" "$cy"
     sleep 0.2
     wechat_scroll "$direction" "$count"
 }
 
 # ============================================================
-# 组合操作：聚焦输入框并发送消息
-#
-# 点击输入框区域 → 清空 → 粘贴消息 → 回车发送
-# 合并为单次操作减少延迟
+# Chats / messages (all via wechat-cli)
 # ============================================================
+
+# Name of the chat that is open
+wechat_current_chat() {
+    wechat_cli --text current 2>/dev/null | sed -n 's/^current_chat: //p'
+}
+
+# Open a chat: session list first, then exact search match; non-zero if another chat ends up open
+wechat_open_chat() {
+    local contact="$1"
+    wechat_cli --text open "$contact"
+}
+
+# Send a message to a chat (confirms the chat, writes via Accessibility, verifies)
 wechat_send_message() {
-    local message="$1"
-    [ -z "$_wechat_win_x" ] && _wechat_update_window
+    local contact="$1" message="$2"
+    wechat_cli --text send "$contact" "${message}${WECHAT_SIGNATURE}"
+}
 
-    local cx=$(( _wechat_win_x + 200 + (_wechat_win_w - 200) / 2 ))
-    local cy=$(( _wechat_win_y + _wechat_win_h - 55 ))
+# Last N messages (text: [sender] text; pass --json for structured output)
+wechat_fetch() {
+    local contact="$1" last_n="${2:-20}" fmt="${3:---text}"
+    wechat_cli "$fmt" fetch "$contact" -n "$last_n"
+}
 
-    # 点击输入框
-    wechat_click "$cx" "$cy"
+# Sidebar chat list (name / last message / time / muted)
+wechat_list_chats() {
+    local max="${1:-30}" fmt="${2:---text}"
+    wechat_cli "$fmt" chats --max "$max"
+}
 
-    # 清空可能的残留内容
-    wechat_cmd "a"
-    sleep 0.1
-    wechat_key 51
-    sleep 0.1
-
-    # 粘贴消息并发送
-    wechat_paste "${message}${WECHAT_SIGNATURE}"
-    sleep 0.2
-    wechat_key 36
+# WeChat version / UI compatibility report (run first after a WeChat update)
+wechat_check() {
+    wechat_cli --text check
 }
 
 # ============================================================
-# 高级操作：向指定联系人/群发送消息
-# background=true 时操作完自动切回之前的应用
+# High-level operations
 # ============================================================
+
+# Send to a contact / group. wechat-cli restores the previously active app itself.
 wechat_send_to() {
-    local contact="$1" message="$2" background="${3:-true}"
-
-    [ "$background" = "true" ] && _wechat_save_context || _wechat_saved_clipboard=$(pbpaste 2>/dev/null || true)
-
-    wechat_activate
-    wechat_open_chat "$contact"
-    wechat_send_message "$message"
-
-    [ "$background" = "true" ] && _wechat_restore_context || {
-        [ -n "$_wechat_saved_clipboard" ] && printf '%s' "$_wechat_saved_clipboard" | pbcopy 2>/dev/null || true
-    }
-
-    echo "✓ 已向「${contact}」发送消息：${message}"
+    local contact="$1" message="$2"
+    if wechat_send_message "$contact" "$message"; then
+        echo "✓ Sent to \"${contact}\": ${message}"
+        return 0
+    fi
+    echo "✗ Could not send to \"${contact}\" (see the reason above); take a screenshot to check" >&2
+    return 1
 }
 
-# ============================================================
-# 高级操作：查看当前会话聊天记录
-# scroll_up: 向上滚动量（0=当前屏）
-# ============================================================
-wechat_read_chat() {
-    local scroll_up="${1:-0}" output="${2:-/tmp/wechat-chat.png}" background="${3:-true}"
+# View a chat: prefer wechat_fetch (faster, exact); screenshot only to look at photos / stickers
+wechat_view_chat() {
+    local contact="$1" scroll_up="${2:-0}" output="${3:-/tmp/wechat-chat.png}" background="${4:-true}"
+    local rc=0
 
     [ "$background" = "true" ] && _wechat_save_context
 
+    wechat_cli --text open "$contact" >/dev/null || rc=1
     wechat_activate
 
-    # 聚焦聊天区域
-    [ -z "$_wechat_win_x" ] && _wechat_update_window
-    local cx=$(( _wechat_win_x + 200 + (_wechat_win_w - 200) / 2 ))
-    local cy=$(( _wechat_win_y + _wechat_win_h / 2 ))
-    wechat_click "$cx" "$cy"
+    if [ "$scroll_up" -gt 0 ]; then
+        wechat_scroll_chat up "$scroll_up"
+    fi
 
-    [ "$scroll_up" -gt 0 ] && wechat_scroll_chat up "$scroll_up"
-
-    wechat_screenshot "$output"
+    wechat_screenshot "$output" >/dev/null
 
     [ "$background" = "true" ] && _wechat_restore_context
 
     echo "$output"
+    return $rc
 }
 
-# ============================================================
-# 高级操作：打开指定会话并截屏
-# ============================================================
-wechat_view_chat() {
-    local contact="$1" scroll_up="${2:-0}" output="${3:-/tmp/wechat-chat.png}" background="${4:-true}"
+# Screenshot the current chat (does not switch chats)
+wechat_read_chat() {
+    local scroll_up="${1:-0}" output="${2:-/tmp/wechat-chat.png}" background="${3:-true}"
 
-    [ "$background" = "true" ] && _wechat_save_context || _wechat_saved_clipboard=$(pbpaste 2>/dev/null || true)
-
+    [ "$background" = "true" ] && _wechat_save_context
     wechat_activate
-    wechat_open_chat "$contact"
-
-    [ -z "$_wechat_win_x" ] && _wechat_update_window
-    local cx=$(( _wechat_win_x + 200 + (_wechat_win_w - 200) / 2 ))
-    local cy=$(( _wechat_win_y + _wechat_win_h / 2 ))
-    wechat_click "$cx" "$cy"
-
     [ "$scroll_up" -gt 0 ] && wechat_scroll_chat up "$scroll_up"
-
-    wechat_screenshot "$output"
-
-    [ "$background" = "true" ] && _wechat_restore_context || {
-        [ -n "$_wechat_saved_clipboard" ] && printf '%s' "$_wechat_saved_clipboard" | pbcopy 2>/dev/null || true
-    }
+    wechat_screenshot "$output" >/dev/null
+    [ "$background" = "true" ] && _wechat_restore_context
 
     echo "$output"
 }
